@@ -30,6 +30,7 @@ project/
 ├─ unlabeled img/         # immagini grezze da etichettare
 ├─ labeled img/           # JSON Labelme salvati da Labelme
 ├─ coco/                  # JSON in formato COCO (+ eventuali immagini)
+├─ augmented/                  # JSON in formato COCO + immagini augmented
 ├─ test img/              # immagini per il test del modello
 ├─ to coco.py
 ├─ augment.py
@@ -86,21 +87,10 @@ python "augment.py"
 
 ### Trasformazioni effettivamente usate
 > **Sostituisci/aggiorna questa lista in base a ciò che fa davvero `augment.py`.** Esempio tipico:
-- Flip orizzontale
-- Flip verticale
-- Rotazione casuale (±X°)
-- Ridimensionamento / Zoom
-- Traslazione (shift X/Y)
-- Crop casuale e/o padding
-- Shear (taglio)
-- Jitter colore (luminosità/contrasto/saturazione/tono)
-- Rumore gaussiano
-- Blur (gaussiano/median)
-- Deformazione elastica
-- Cutout / Random erasing
-- (Opzionale) Prospettiva / Affine
-
-> Verifica anche: probabilità per trasformazione, range dei parametri e **quante immagini aggiuntive** vengono create.
+- **Flip orizzontale**
+- **Rotazione** (da un set fisso di angoli: 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
+- **Ridimensionamento / Zoom** (fattore casuale tra 0.8× e 1.2×)
+- **Jitter colore** (solo luminosità e contrasto)
 
 ---
 
