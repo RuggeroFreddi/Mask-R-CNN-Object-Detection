@@ -1,3 +1,8 @@
 maskrcnn/
 test img/
 unlabeled img/
+labeled img/
+coco/
+augmented/
+
+.DS_Store/
