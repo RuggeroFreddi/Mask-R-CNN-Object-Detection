@@ -4,5 +4,6 @@ unlabeled img/
 labeled img/
 coco/
 augmented/
+modelli/
 
 .DS_Store/
