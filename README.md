@@ -86,7 +86,6 @@ python "augment.py"
 ```
 
 ### Trasformazioni effettivamente usate
-> **Sostituisci/aggiorna questa lista in base a ciò che fa davvero `augment.py`.** Esempio tipico:
 - **Flip orizzontale**
 - **Rotazione** (da un set fisso di angoli: 0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°)
 - **Ridimensionamento / Zoom** (fattore casuale tra 0.8× e 1.2×)
