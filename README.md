@@ -30,7 +30,7 @@ project/
 ├─ unlabeled img/         # immagini grezze da etichettare
 ├─ labeled img/           # JSON Labelme salvati da Labelme
 ├─ coco/                  # JSON in formato COCO (+ eventuali immagini)
-├─ augmented/                  # JSON in formato COCO + immagini augmented
+├─ augmented/             # JSON in formato COCO + immagini augmented
 ├─ test img/              # immagini per il test del modello
 ├─ to coco.py
 ├─ augment.py
