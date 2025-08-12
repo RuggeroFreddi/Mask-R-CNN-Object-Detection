@@ -1,365 +1,262 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+import os
 import json
-from pathlib import Path
-from typing import Dict, List, Tuple
-
 import numpy as np
-from PIL import Image, ImageDraw
+from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils import clip_grad_norm_
 import torchvision
 from torchvision.models.detection import maskrcnn_resnet50_fpn
-
+from torchvision.transforms import functional as F
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 
 # =========================
-# ===== Dataset COCO ======
+# ====== CONFIG/CONST =====
 # =========================
+IMG_DIR = "augmented"                 # cartella immagini
+ANN_PATH = "augmented/augmented_coco.json"  # COCO aggregato
 
+BATCH_SIZE = 1                        # lascia 1 per debug stabile
+NUM_EPOCHS = 4
+LEARNING_RATE = 1e-3                  # prudente (prima 5e-3)
+WEIGHT_DECAY = 5e-4
+GRAD_CLIP_NORM = 5.0                  # gradient clipping
+
+# filtri anti-degeneri lato Dataset
+MIN_BOX_SIDE = 1.0                    # scarta box con lato <= 1 px
+MIN_MASK_PIXELS = 16                  # scarta mask con < N pixel ON
+
+
+# =========================
+# ======== DATASET ========
+# =========================
 class CocoDataset(Dataset):
-    """Dataset COCO minimale per Mask R-CNN (poligoni → maschere)."""
-
-    def __init__(self, img_dir: str | Path, ann_path: str | Path, transforms=None):
+    """
+    Dataset COCO minimal per Mask R-CNN.
+    - Usa segmentation poligonali per costruire le mask
+    - Forza labels = 1 (una sola classe: 'organoid')
+    - Filtra istanze con mask vuota o bbox piatta
+    """
+    def __init__(self, img_dir, ann_path, transforms=None):
         self.img_dir = Path(img_dir)
         self.transforms = transforms
 
         with open(ann_path, "r", encoding="utf-8") as f:
             coco = json.load(f)
 
-        self.images = coco["images"]
-        self.annotations = coco["annotations"]
-        # Mappa id_categoria -> nome
-        self.categories = {c["id"]: c["name"] for c in coco["categories"]}
+        self.images = coco.get("images", [])
+        self.annotations = coco.get("annotations", [])
 
-        # Mappa image_id -> [ann, ...]
-        self.ann_map: Dict[int, List[dict]] = {}
+        # indicizza annotations per image_id
+        self.ann_map = {}
         for ann in self.annotations:
             self.ann_map.setdefault(ann["image_id"], []).append(ann)
 
-        # Mappa category_id COCO -> label contigua [1..K] (0 è background)
-        cat_ids_sorted = sorted(self.categories.keys())
-        self.catid_to_contig = {cid: (i + 1) for i, cid in enumerate(cat_ids_sorted)}
-        self.num_classes = 1 + len(self.catid_to_contig)
+    def __len__(self):
+        return len(self.images)
 
-        # Indici immagini con almeno una bbox valida
-        self.valid_indices: List[int] = []
-        for i, img_info in enumerate(self.images):
+    def _poly_to_mask_and_box(self, poly, width, height):
+        """Crea mask (H,W) uint8 e bbox [x1,y1,x2,y2] da un poligono flat."""
+        if not poly or len(poly) < 6:
+            return None, None
+
+        # mask
+        mask_img = Image.new("L", (width, height), 0)
+        pts = list(map(tuple, np.array(poly, dtype=np.float32).reshape(-1, 2)))
+        ImageDraw.Draw(mask_img).polygon(pts, outline=1, fill=1)
+        mask = np.array(mask_img, dtype=np.uint8)  # (H,W)
+
+        # bbox dai punti (robusto)
+        xs = poly[0::2]
+        ys = poly[1::2]
+        x_min, y_min = float(min(xs)), float(min(ys))
+        x_max, y_max = float(max(xs)), float(max(ys))
+        # clamp all'interno immagine
+        x_min = max(0.0, min(x_min, width - 1))
+        y_min = max(0.0, min(y_min, height - 1))
+        x_max = max(0.0, min(x_max, width - 1))
+        y_max = max(0.0, min(y_max, height - 1))
+        if x_max <= x_min or y_max <= y_min:
+            return None, None
+
+        return mask, [x_min, y_min, x_max, y_max]
+
+    def __getitem__(self, idx):
+        # protezione circolare in caso di sample vuoti
+        loop_guard = 0
+        while loop_guard < len(self):
+            img_info = self.images[idx]
+            file_name = img_info["file_name"]
+            width, height = int(img_info["width"]), int(img_info["height"])
+
+            img_path = self.img_dir / file_name
+            img = Image.open(img_path).convert("RGB")
+
             anns = self.ann_map.get(img_info["id"], [])
-            if any(self._ann_has_valid_bbox(a) for a in anns):
-                self.valid_indices.append(i)
+            masks, boxes = [], []
 
-    @staticmethod
-    def _ann_has_valid_bbox(ann: dict) -> bool:
-        x, y, w, h = ann.get("bbox", [0, 0, 0, 0])
-        return (w is not None) and (h is not None) and (w > 0) and (h > 0)
+            for ann in anns:
+                seg = ann.get("segmentation")
+                if not seg or not isinstance(seg, list) or len(seg) == 0:
+                    continue
+                poly = seg[0]
+                mask, box_xyxy = self._poly_to_mask_and_box(poly, width, height)
+                if mask is None:
+                    continue
 
-    def __len__(self) -> int:
-        return len(self.valid_indices)
+                # filtri anti-degeneri
+                if mask.sum() < MIN_MASK_PIXELS:
+                    continue
+                x1, y1, x2, y2 = box_xyxy
+                if (x2 - x1) <= MIN_BOX_SIDE or (y2 - y1) <= MIN_BOX_SIDE:
+                    continue
 
-    def __getitem__(self, idx: int):
-        real_idx = self.valid_indices[idx]
-        img_info = self.images[real_idx]
+                masks.append(mask)
+                boxes.append([x1, y1, x2, y2])
 
-        img_path = self.img_dir / img_info["file_name"]
-        img = Image.open(img_path).convert("RGB")
-        width, height = img.size
-
-        anns = self.ann_map.get(img_info["id"], [])
-
-        masks: List[np.ndarray] = []
-        boxes: List[List[float]] = []
-        labels: List[int] = []
-
-        for ann in anns:
-            if not self._ann_has_valid_bbox(ann):
+            if len(boxes) == 0:
+                # passa al sample successivo
+                idx = (idx + 1) % len(self)
+                loop_guard += 1
                 continue
 
-            seg = ann.get("segmentation")
-            if not seg or not isinstance(seg, list) or not seg[0]:
-                continue
+            # tensori target
+            masks = torch.as_tensor(np.stack(masks, axis=0), dtype=torch.uint8)   # [N,H,W]
+            boxes = torch.as_tensor(boxes, dtype=torch.float32)                   # [N,4]
+            labels = torch.ones((boxes.shape[0],), dtype=torch.int64)             # una sola classe: 1
 
-            flat = seg[0]
-            poly = np.array(flat, dtype=np.float32).reshape(-1, 2)
+            target = {
+                "boxes": boxes,
+                "labels": labels,
+                "masks": masks,
+                "image_id": torch.tensor([img_info["id"]], dtype=torch.int64),
+                "iscrowd": torch.zeros((boxes.shape[0],), dtype=torch.int64),
+                # metadati utili per debug (NON tensor, non verrà .to(device))
+                "file_name_str": file_name,
+            }
 
-            # Maschera dalla polygon
-            mask_img = Image.new("L", (width, height), 0)
-            ImageDraw.Draw(mask_img).polygon([tuple(p) for p in poly], outline=1, fill=1)
-            mask = np.array(mask_img, dtype=np.uint8)
-            if mask.max() == 0:
-                continue
+            if self.transforms:
+                img = self.transforms(img)
 
-            masks.append(mask)
+            return img, target
 
-            # COCO bbox [x, y, w, h] -> [x1, y1, x2, y2]
-            x, y, w, h = ann["bbox"]
-            boxes.append([x, y, x + w, y + h])
-
-            # category_id -> label contigua [1..K]
-            cid = int(ann["category_id"])
-            labels.append(self.catid_to_contig.get(cid, 1))
-
-        if not boxes:
-            # Se nessuna annotazione valida, passa all'elemento successivo
-            return self.__getitem__((idx + 1) % len(self))
-
-        boxes_t = torch.as_tensor(boxes, dtype=torch.float32)
-        labels_t = torch.as_tensor(labels, dtype=torch.int64)
-        masks_t = torch.as_tensor(np.stack(masks), dtype=torch.uint8)
-
-        target = {
-            "boxes": boxes_t,
-            "labels": labels_t,
-            "masks": masks_t,
-            "image_id": torch.as_tensor(img_info["id"], dtype=torch.int64),
-        }
-
-        if self.transforms:
-            img = self.transforms(img)
-
-        return img, target
-
+        # Se proprio non trova niente (tutto degenero), solleva
+        raise RuntimeError("Tutti i sample risultano senza istanze valide dopo i filtri.")
 
 # =========================
-# ===== Transforms ========
+# ====== TRANSFORMS =======
 # =========================
-
 def get_transform():
-    return torchvision.transforms.Compose([
-        torchvision.transforms.ToTensor()
-    ])
+    return torchvision.transforms.Compose([torchvision.transforms.ToTensor()])
 
 
 # =========================
-# ===== Model helpers =====
+# ======== MODELLO ========
 # =========================
-
-def get_model_instance_segmentation(num_classes: int):
+def get_model_instance_segmentation(num_classes=2):
     model = maskrcnn_resnet50_fpn(weights="DEFAULT")
-
-    # Classificatore box
+    # classifier head
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = torchvision.models.detection.faster_rcnn.FastRCNNPredictor(
         in_features, num_classes
     )
-
-    # Predittore maschere
+    # mask head
     in_features_mask = model.roi_heads.mask_predictor.conv5_mask.in_channels
-    hidden_layer = 256
     model.roi_heads.mask_predictor = torchvision.models.detection.mask_rcnn.MaskRCNNPredictor(
-        in_features_mask, hidden_layer, num_classes
+        in_features_mask, 256, num_classes
+        # num_classes = 2  (background + organoid)
     )
     return model
 
 
-@torch.no_grad()
-def _to_device_batch(batch_imgs, batch_targets, device):
-    imgs = [im.to(device) for im in batch_imgs]
-    tgts = [{k: v.to(device) for k, v in t.items()} for t in batch_targets]
-    return imgs, tgts
-
-
-def collate_fn(batch):
-    """Top-level per essere picklable con num_workers>0 su macOS."""
-    return tuple(zip(*batch))
-
-
 # =========================
-# ======= Training ========
+# ======= TRAIN LOOP ======
 # =========================
-
-def train_one_epoch(model, dataloader, optimizer, device) -> float:
+def train_one_epoch(model, dataloader, optimizer, device):
     model.train()
-    total_loss = 0.0
-    steps = 0
+    total_loss, steps = 0.0, 0
 
-    pbar = tqdm(dataloader, desc="⏳ Training", ncols=90)
-    for imgs, targets in pbar:
-        imgs, targets = _to_device_batch(imgs, targets, device)
+    pbar = tqdm(dataloader, desc="⏳ Training", ncols=80)
+    for step, (imgs, targets) in enumerate(pbar):
+        # sposta su device SOLO i tensori
+        imgs = [img.to(device) for img in imgs]
+        tgts = []
+        for t in targets:
+            tt = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()}
+            tgts.append(tt)
 
-        loss_dict = model(imgs, targets)
-        loss = sum(loss_dict.values())
+        # forward -> dict di loss
+        loss_dict = model(imgs, tgts)
+        losses = sum(loss for loss in loss_dict.values())
 
-        optimizer.zero_grad()
-        loss.backward()
+        # guardia: salta batch non finiti
+        if not torch.isfinite(losses):
+            loss_cpu = {k: float(v.detach().cpu()) for k, v in loss_dict.items()}
+            print(f"\n⚠️  batch {step}: loss non finita -> {loss_cpu}")
+            # info di debug sul primo target
+            t0 = tgts[0]
+            print("   file:", t0.get("file_name_str", "?"),
+                  "| boxes:", tuple(t0["boxes"].shape),
+                  "| masks:", tuple(t0["masks"].shape),
+                  "| labels uniq:", t0["labels"].unique().tolist())
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
+        optimizer.zero_grad(set_to_none=True)
+        losses.backward()
+        clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += float(losses.detach().cpu())
         steps += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(loss=f"{float(losses.detach().cpu()):.4f}")
 
-    avg = total_loss / max(steps, 1)
+    avg = total_loss / max(1, steps)
     print(f"📉 Loss media epoca: {avg:.4f}")
     return avg
 
 
 # =========================
-# ======= Valutazione =====
+# ========= MAIN ==========
 # =========================
-
-@torch.no_grad()
-def mask_iou(m1: np.ndarray, m2: np.ndarray) -> float:
-    """IoU tra due maschere binarie [H,W]."""
-    m1b = m1.astype(bool)
-    m2b = m2.astype(bool)
-    inter = np.logical_and(m1b, m2b).sum()
-    union = np.logical_or(m1b, m2b).sum()
-    return float(inter) / float(union) if union > 0 else 0.0
-
-
-@torch.no_grad()
-def evaluate_one_epoch(
-    model,
-    dataloader: DataLoader,
-    device,
-    iou_thr: float = 0.5,
-    score_thr: float = 0.0
-) -> Tuple[float, float, float, float]:
-    """
-    Valutazione semplice:
-      - TP/FP/FN con matching greedy su IoU maschere (stessa classe)
-      - Precision, Recall, F1 e mIoU dei match
-
-    Nota: batch_size=1 consigliato per semplicità.
-    """
-    model.eval()
-
-    total_tp = 0
-    total_fp = 0
-    total_fn = 0
-    ious_matched: List[float] = []
-
-    for imgs, targets in tqdm(dataloader, desc="🔎 Val", ncols=90):
-        imgs, targets = _to_device_batch(imgs, targets, device)
-        outputs = model(imgs)  # batch size 1
-
-        # GT
-        gt_masks = targets[0]["masks"].cpu().numpy().astype(np.uint8)
-        gt_labels = targets[0]["labels"].cpu().numpy()
-
-        # Pred
-        out = outputs[0]
-        scores = out["scores"].detach().cpu().numpy()
-        keep = scores >= score_thr
-        pred_masks = out["masks"].detach().cpu().numpy()[keep, 0]  # [N,1,H,W] -> [N,H,W]
-        pred_labels = out["labels"].detach().cpu().numpy()[keep]
-
-        # Greedy matching per classe
-        used_gt = np.zeros(len(gt_masks), dtype=bool)
-
-        # Ordina pred per score desc
-        order = np.argsort(scores[keep])[::-1]
-        pred_masks = pred_masks[order]
-        pred_labels = pred_labels[order]
-
-        for pmask, plab in zip(pred_masks, pred_labels):
-            best_iou = 0.0
-            best_j = -1
-            for j, (gmask, glab) in enumerate(zip(gt_masks, gt_labels)):
-                if used_gt[j] or glab != plab:
-                    continue
-                iou = mask_iou(pmask > 0.5, gmask > 0.5)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_j = j
-
-            if best_iou >= iou_thr and best_j >= 0:
-                total_tp += 1
-                used_gt[best_j] = True
-                ious_matched.append(best_iou)
-            else:
-                total_fp += 1
-
-        total_fn += int((~used_gt).sum())
-
-    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
-    miou = float(np.mean(ious_matched)) if ious_matched else 0.0
-
-    # "Accuracy" come recall@0.5 IoU (TP/GT), più leggibile nel log
-    accuracy = recall
-
-    print(
-        f"✅ Val @IoU≥{iou_thr:.2f}: "
-        f"accuracy={accuracy:.3f}  precision={precision:.3f}  recall={recall:.3f}  f1={f1:.3f}  mIoU={miou:.3f}  "
-        f"[TP={total_tp} FP={total_fp} FN={total_fn}]"
-    )
-    return accuracy, precision, recall, f1
-
-
-# =========================
-# ========= Main ==========
-# =========================
-
 def main():
-    # Path del dataset aumentato
-    img_dir = "augmented"
-    ann_path = "augmented/augmented_coco.json"
-
-    # Dataset completo
-    full_ds = CocoDataset(img_dir=img_dir, ann_path=ann_path, transforms=get_transform())
-    print(f"📦 Immagini con annotazioni valide (totale): {len(full_ds)}")
-    if len(full_ds) == 0:
-        raise RuntimeError("Nessuna immagine valida trovata. Controlla augmented_coco.json e i path.")
-
-    num_classes = full_ds.num_classes  # include background
-    print(f"🔢 num_classes (incl. background): {num_classes}")
-
-    # Split train/val riproducibile (90/10)
-    rng = np.random.default_rng(42)
-    indices = np.arange(len(full_ds))
-    rng.shuffle(indices)
-    split = max(1, int(0.1 * len(indices)))
-    val_indices = indices[:split].tolist()
-    train_indices = indices[split:].tolist()
-
-    train_ds = Subset(full_ds, train_indices)
-    val_ds = Subset(full_ds, val_indices)
-
-    # DataLoader
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=2,
+    # dataset + loader
+    dataset = CocoDataset(IMG_DIR, ANN_PATH, transforms=get_transform())
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
-        collate_fn=collate_fn,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=1,          # semplifica matching
-        shuffle=False,
-        num_workers=1,
-        collate_fn=collate_fn,
+        num_workers=0,                      # tienilo a 0 su macOS per debug
+        collate_fn=lambda x: tuple(zip(*x))
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🖥️ Device: {device}")
+    print("🖥️ Device:", device)
 
-    model = get_model_instance_segmentation(num_classes).to(device)
+    # modello
+    model = get_model_instance_segmentation(num_classes=2)
+    model.to(device)
 
+    # ottimizzatore un po' più prudente
     optimizer = torch.optim.SGD(
         model.parameters(),
-        lr=0.005,
+        lr=LEARNING_RATE,
         momentum=0.9,
-        weight_decay=0.0005,
+        weight_decay=WEIGHT_DECAY
     )
 
-    num_epochs = 5
-    for epoch in range(num_epochs):
-        print(f"\n=== Epoch {epoch + 1}/{num_epochs} ===")
-        train_one_epoch(model, train_loader, optimizer, device)
-        # Valutazione ad ogni epoca
-        evaluate_one_epoch(model, val_loader, device, iou_thr=0.5, score_thr=0.0)
+    # training
+    for epoch in range(1, NUM_EPOCHS + 1):
+        print(f"\n=== Epoch {epoch} ===")
+        train_one_epoch(model, loader, optimizer, device)
 
-    # Salvataggio in 'modelli/'
-    Path("modelli").mkdir(exist_ok=True)
-    out_path = Path("modelli") / "maskrcnn_mycell_1.pth"
+    # salva pesi
+    out_path = "modelli/maskrcnn_organoid.pth"
     torch.save(model.state_dict(), out_path)
-    print(f"💾 Modello salvato: {out_path.resolve()}")
+    print(f"✅ Modello salvato: {out_path}")
 
 
 if __name__ == "__main__":

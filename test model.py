@@ -27,8 +27,8 @@ from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 # ========= Config ========
 # =========================
 
-IMAGE_DIR = Path("unlabeled img")
-MODEL_PATH = Path("modelli") / "maskrcnn_mycell_1.pth"
+IMAGE_DIR = Path("test img")
+MODEL_PATH = Path("modelli") / "maskrcnn_organoid.pth"
 COCO_PATH = Path("augmented") / "augmented_coco.json"  # opzionale per nomi classe
 
 NUM_CLASSES = 2          # background + 1 classe (aggiorna se necessario)
