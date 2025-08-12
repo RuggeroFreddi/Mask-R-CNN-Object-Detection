@@ -39,7 +39,7 @@
   *Esempi*: `256`⚡; `512` (più segnale, più memoria).
 - **`rpn_positive_fraction`** — quota positivi nel batch RPN.  
   *Esempi*: `0.5`⚡; `0.25` se pochi positivi rumorosi.
-- **`pre_nms_top_n_train/test`** — proposte tenute **prima** della NMS (La **NMS (Non-Maximum Suppression)** elimina le bounding box ridondanti, mantenendo solo quelle con punteggio più alto e poca sovrapposizione reciproca.
+- **`pre_nms_top_n_train/test`** — proposte tenute **prima** della NMS (La **NMS, ovvero Non-Maximum Suppression,** elimina le bounding box ridondanti, mantenendo solo quelle con punteggio più alto e poca sovrapposizione reciproca.
 ). 
   *Esempi*: `2000/1000`⚡; `600/300` per accelerare.
 - **`post_nms_top_n_train/test`** — proposte **dopo** NMS.  
