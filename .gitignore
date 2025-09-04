@@ -223,5 +223,7 @@ labeled img/
 coco/
 augmented/
 modelli/
+ausiliaria/
+cnn_virtual_env/
 
 .DS_Store/
