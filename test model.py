@@ -17,6 +17,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
+from PIL.ExifTags import TAGS
 from torchvision.transforms import functional as F
 from torchvision.models.detection import maskrcnn_resnet50_fpn
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
@@ -39,6 +40,64 @@ FILL_ALPHA = 0.65                # opacità del riempimento maschera
 OUTLINE_WIDTH = 3.0              # spessore bordo colorato
 OUTLINE_HALO_WIDTH = 6.0         # spessore halo nero sotto al bordo
 OUTLINE_HALO_COLOR = "black"     # colore halo per contrasto
+
+
+
+
+
+# =========================
+# ===== Retrieve Metadata ======
+# =========================
+
+def get_pixel_info(image_file_path):
+    """
+    Estrae la dimensione lineare e l'area di un singolo pixel
+    dai metadati EXIF dell'immagine.
+
+    Parametri:
+        image_file_path (str): Percorso al file immagine.
+
+    Ritorna:
+        dict: {
+            "pixel_size_um": float,
+            "pixel_area_um2": float
+        } oppure None se i dati non sono disponibili.
+    """
+    try:
+        image = Image.open(image_file_path)
+        exif_data = image._getexif()
+        if not exif_data:
+            print("Nessun dato EXIF trovato.")
+            return None
+
+        readable_exif = {TAGS.get(tag, tag): value for tag, value in exif_data.items()}
+        x_res = readable_exif.get("FocalPlaneXResolution")
+        res_unit = readable_exif.get("FocalPlaneResolutionUnit")
+
+        if not x_res or not res_unit:
+            print("Dati di risoluzione del piano focale mancanti.")
+            return None
+
+        # Calcolo dimensione pixel (lato) in micrometri
+        if res_unit == 2:  # Inch
+            pixel_size_um = (1 / x_res) * 25.4 * 1000
+        elif res_unit == 3:  # Centimetri
+            pixel_size_um = (1 / x_res) * 10 * 1000
+        else:
+            print(f"Unità di misura non supportata (code: {res_unit})")
+            return None
+
+        # Calcolo area pixel in micrometri quadrati
+        pixel_area_um2 = pixel_size_um ** 2
+
+        return {
+            "pixel_size_um": pixel_size_um,
+            "pixel_area_um2": pixel_area_um2
+        }
+
+    except Exception as e:
+        print(f"Errore durante la lettura dell'immagine: {e}")
+        return None
 
 
 # =========================
@@ -85,6 +144,7 @@ def overlay_fill_only(
     labels: np.ndarray,
     class_names: List[str],
     score_thr: float,
+    area_info: dict,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Applica SOLO il riempimento delle maschere (blend) sull'immagine e
@@ -126,7 +186,7 @@ def overlay_fill_only(
 
         cls_idx = int(labels[i])
         cls_name = class_names[cls_idx] if 0 <= cls_idx < len(class_names) else f"id_{cls_idx}"
-        print(f"   • {cls_name}: score={scores[i]:.2f}  area={area_px}px  ({area_pct:.2f}%)")
+        print(f"   • {cls_name}: score={scores[i]:.2f}  area={area_px*area_info['pixel_area_um2']} um2  ({area_pct:.2f}%)")
 
         # Riempimento (blend)
         img_out[mask_bin] = (
@@ -225,6 +285,7 @@ def main() -> None:
 
     for img_path in image_paths:
         print(f"\n📷 {img_path.name}")
+        info = get_pixel_info(img_path)
         image_pil = Image.open(img_path).convert("RGB")
         image_tensor = F.to_tensor(image_pil).unsqueeze(0).to(device)
 
@@ -244,6 +305,7 @@ def main() -> None:
             labels=labels,
             class_names=class_names,
             score_thr=SCORE_THRESHOLD,
+            area_info=info
         )
 
         # Mostra immagine finale (una sola volta) e attende input
