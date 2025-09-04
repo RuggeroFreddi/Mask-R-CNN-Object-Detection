@@ -3,8 +3,9 @@
 
 """
 Inferenza Mask R-CNN su tutte le immagini in 'unlabeled img/' con maschere
-ben visibili: fill opaco, contorno doppio (halo nero + bordo colorato) e
-stampa area per ogni istanza. Una sola finestra per immagine.
+ben visibili: fill opaco, contorno doppio (halo nero + bordo colorato),
+stampa area per ogni istanza e box rettangolare sopra l'oggetto con la sua area.
+Una sola finestra per immagine.
 """
 
 from __future__ import annotations
@@ -42,27 +43,12 @@ OUTLINE_HALO_WIDTH = 6.0         # spessore halo nero sotto al bordo
 OUTLINE_HALO_COLOR = "black"     # colore halo per contrasto
 
 
-
-
-
 # =========================
 # ===== Retrieve Metadata ======
 # =========================
 
 def get_pixel_info(image_file_path):
-    """
-    Estrae la dimensione lineare e l'area di un singolo pixel
-    dai metadati EXIF dell'immagine.
-
-    Parametri:
-        image_file_path (str): Percorso al file immagine.
-
-    Ritorna:
-        dict: {
-            "pixel_size_um": float,
-            "pixel_area_um2": float
-        } oppure None se i dati non sono disponibili.
-    """
+    """Estrae dimensione e area pixel dai metadati EXIF."""
     try:
         image = Image.open(image_file_path)
         exif_data = image._getexif()
@@ -78,7 +64,6 @@ def get_pixel_info(image_file_path):
             print("Dati di risoluzione del piano focale mancanti.")
             return None
 
-        # Calcolo dimensione pixel (lato) in micrometri
         if res_unit == 2:  # Inch
             pixel_size_um = (1 / x_res) * 25.4 * 1000
         elif res_unit == 3:  # Centimetri
@@ -87,7 +72,6 @@ def get_pixel_info(image_file_path):
             print(f"Unità di misura non supportata (code: {res_unit})")
             return None
 
-        # Calcolo area pixel in micrometri quadrati
         pixel_area_um2 = pixel_size_um ** 2
 
         return {
@@ -116,7 +100,7 @@ def load_contiguous_class_names(coco_path: Path) -> List[str]:
     cats_sorted = sorted(cats, key=lambda c: c["id"])
     names = ["background"] + [c.get("name", f"class_{i+1}") for i, c in enumerate(cats_sorted)]
 
-    if len(names) != NUM_CLASSES:  # adatta con prudenza
+    if len(names) != NUM_CLASSES:
         names = names[:NUM_CLASSES] if len(names) >= NUM_CLASSES else names + [
             f"class_{i}" for i in range(len(names), NUM_CLASSES)
         ]
@@ -146,15 +130,7 @@ def overlay_fill_only(
     score_thr: float,
     area_info: dict,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Applica SOLO il riempimento delle maschere (blend) sull'immagine e
-    stampa area (px e %) per ogni istanza mantenuta.
-    NON crea figure. Ritorna:
-      - img_out (con fill)
-      - masks_kept (ordinati per score)
-      - labels_kept
-      - scores_kept
-    """
+    """Applica il riempimento delle maschere e stampa l’area."""
     h, w = image_np.shape[:2]
     total_px = float(h * w)
 
@@ -167,7 +143,6 @@ def overlay_fill_only(
         print("— Nessuna maschera sopra soglia —")
         return image_np, masks, labels, scores
 
-    # Ordina per score decrescente (solo per log)
     order = np.argsort(scores)[::-1]
     masks = masks[order]
     scores = scores[order]
@@ -177,18 +152,15 @@ def overlay_fill_only(
     cmap = plt.get_cmap("tab20")
 
     for i in range(len(masks)):
-        color_rgb = np.array(cmap(i % cmap.N))[:3]  # [0..1, 0..1, 0..1]
+        color_rgb = np.array(cmap(i % cmap.N))[:3]
         mask_bin = masks[i] > 0.5
 
-        # Area
         area_px = int(mask_bin.sum())
         area_pct = (area_px / total_px) * 100.0
-
         cls_idx = int(labels[i])
         cls_name = class_names[cls_idx] if 0 <= cls_idx < len(class_names) else f"id_{cls_idx}"
-        print(f"   • {cls_name}: score={scores[i]:.2f}  area={area_px*area_info['pixel_area_um2']} um2  ({area_pct:.2f}%)")
+        print(f"   • {cls_name}: score={scores[i]:.2f}  area={area_px*area_info['pixel_area_um2']} µm²  ({area_pct:.2f}%)")
 
-        # Riempimento (blend)
         img_out[mask_bin] = (
             img_out[mask_bin] * (1.0 - FILL_ALPHA) + color_rgb * 255.0 * FILL_ALPHA
         ).astype(np.uint8)
@@ -203,15 +175,9 @@ def show_and_wait(
     labels: np.ndarray | None = None,
     scores: np.ndarray | None = None,
     class_names: List[str] | None = None,
+    area_info: dict | None = None,
 ) -> bool:
-    """
-    Mostra una sola finestra:
-      - Visualizza img_np (già con fill)
-      - Se masks/labels/scores sono forniti: disegna contorni (halo + bordo) e label
-      - Attende:
-          qualsiasi tasto -> continua (return False)
-          ESC o 'q'       -> esce (return True)
-    """
+    """Mostra immagine con solo box di testo sopra gli oggetti, senza contorni."""
     want_exit = {"flag": False}
 
     fig, ax = plt.subplots(figsize=(10, 10))
@@ -221,25 +187,33 @@ def show_and_wait(
     fig.tight_layout()
 
     if masks is not None and len(masks) > 0:
-        cmap = plt.get_cmap("tab20")
         for i in range(len(masks)):
             z = (masks[i] > 0.5).astype(float)
-            color_rgb = np.array(cmap(i % cmap.N))[:3]
-            # Halo + bordo
-            ax.contour(z, levels=[0.5], colors=[OUTLINE_HALO_COLOR],
-                       linewidths=OUTLINE_HALO_WIDTH, alpha=0.95)
-            ax.contour(z, levels=[0.5], colors=[color_rgb],
-                       linewidths=OUTLINE_WIDTH, alpha=1.0)
-            # Etichetta al centroide
             ys, xs = np.nonzero(z > 0.5)
-            if len(xs) > 0 and class_names is not None and labels is not None and scores is not None:
+            if len(xs) > 0:
+                # Centroide
                 cx, cy = int(xs.mean()), int(ys.mean())
-                cls_idx = int(labels[i])
-                cls_name = class_names[cls_idx] if 0 <= cls_idx < len(class_names) else f"id_{cls_idx}"
+
+                # Area in µm² o px
+                area_px = len(xs)
+                if area_info is not None:
+                    area_um2 = area_px * area_info["pixel_area_um2"]
+                    area_str = f"{area_um2:.0f} µm²"
+                else:
+                    area_str = f"{area_px} px"
+
+                # Testo sopra il centroide
+                cls_idx = int(labels[i]) if labels is not None else -1
+                cls_name = (
+                    class_names[cls_idx]
+                    if (class_names is not None and 0 <= cls_idx < len(class_names))
+                    else f"id_{cls_idx}"
+                )
+                score_str = f"{float(scores[i]):.2f}" if scores is not None else ""
                 ax.text(
-                    cx, cy,
-                    f"{cls_name} {float(scores[i]):.2f}",
-                    ha="center", va="center",
+                    cx, cy - 10,  # leggermente sopra il centroide
+                    f"{cls_name} {score_str}\n{area_str}",
+                    ha="center", va="bottom",
                     fontsize=10, color="white",
                     bbox=dict(facecolor="black", alpha=0.6, pad=2),
                 )
@@ -251,7 +225,7 @@ def show_and_wait(
         plt.close(fig)
 
     fig.canvas.mpl_connect("key_press_event", on_key)
-    plt.show()  # blocca finché chiudi con un tasto
+    plt.show()
     return want_exit["flag"]
 
 
@@ -272,13 +246,11 @@ def main() -> None:
     if not image_paths:
         raise FileNotFoundError(f"Nessuna immagine trovata in: {IMAGE_DIR.resolve()}")
 
-    # Modello
     model = build_model(NUM_CLASSES)
     state = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(state)
     model.to(device).eval()
 
-    # Nomi classe
     class_names = load_contiguous_class_names(COCO_PATH)
 
     print(f"➡️  Trovate {len(image_paths)} immagini. Premi un tasto per avanzare; ESC/q per uscire.\n")
@@ -292,11 +264,10 @@ def main() -> None:
         with torch.no_grad():
             output = model(image_tensor)[0]
 
-        masks = output["masks"].cpu().numpy()[:, 0, ...]   # [N, H, W]
+        masks = output["masks"].cpu().numpy()[:, 0, ...]
         labels = output["labels"].cpu().numpy()
         scores = output["scores"].cpu().numpy()
 
-        # Applica SOLO il fill e prepara dati per disegnare i contorni in un'unica finestra
         img_np = np.array(image_pil)
         img_filled, kept_masks, kept_labels, kept_scores = overlay_fill_only(
             image_np=img_np,
@@ -305,10 +276,9 @@ def main() -> None:
             labels=labels,
             class_names=class_names,
             score_thr=SCORE_THRESHOLD,
-            area_info=info
+            area_info=info if info else {"pixel_area_um2": 1.0},
         )
 
-        # Mostra immagine finale (una sola volta) e attende input
         title = f"{img_path.name} — premi un tasto per continuare, ESC/q per uscire"
         if show_and_wait(
             img_np=img_filled,
@@ -317,6 +287,7 @@ def main() -> None:
             labels=kept_labels,
             scores=kept_scores,
             class_names=class_names,
+            area_info=info if info else None,
         ):
             print("👋 Uscita richiesta dall'utente.")
             break
