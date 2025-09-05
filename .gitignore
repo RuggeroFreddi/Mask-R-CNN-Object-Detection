@@ -225,5 +225,6 @@ augmented/
 modelli/
 ausiliaria/
 cnn_virtual_env/
+results/
 
 .DS_Store/
